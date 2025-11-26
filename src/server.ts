@@ -1,5 +1,5 @@
 /**
- * Chat Server for LinkUp Platform
+ * Chat Server for LinkUp Platform 
  * Real-time chat functionality using Socket.IO
  * @module ChatServer
  */
@@ -75,8 +75,6 @@ const activeMeetings = new Map<string, Set<User>>();
 
 /**
  * Authentication middleware for Socket.IO connections
- * @param socket - Socket.IO socket instance
- * @param next - Next function in middleware chain
  */
 const authenticateSocket = async (socket: Socket, next: (err?: Error) => void) => {
   try {
@@ -86,7 +84,6 @@ const authenticateSocket = async (socket: Socket, next: (err?: Error) => void) =
       return next(new Error('Authentication error: No token provided'));
     }
 
-    // Verify Firebase ID token
     const decodedToken = await admin.auth().verifyIdToken(token);
     socket.data.user = {
       uid: decodedToken.uid,
@@ -101,7 +98,6 @@ const authenticateSocket = async (socket: Socket, next: (err?: Error) => void) =
   }
 };
 
-// Apply authentication middleware
 io.use(authenticateSocket);
 
 /**
@@ -113,13 +109,12 @@ io.on('connection', (socket: Socket) => {
 
   /**
    * Join a meeting room
-   * @param data - Meeting join data
    */
   socket.on('join_meeting', async (data: { meetingId: string }) => {
     const { meetingId } = data;
     
     try {
-      // Verify meeting exists and user has access
+      // Verify meeting exists
       const meetingDoc = await db.collection('meetings').doc(meetingId).get();
       
       if (!meetingDoc.exists) {
@@ -129,25 +124,48 @@ io.on('connection', (socket: Socket) => {
 
       const meeting = meetingDoc.data();
       
-      // Check if user is owner or participant
-      if (meeting?.ownerUid !== user.uid && !meeting?.participants?.includes(user.uid)) {
-        socket.emit('error', { message: 'Access denied to this meeting' });
-        return;
+      // ✅ PERMITIR ACCESO: Agregar automáticamente como participante
+      const isOwner = meeting?.ownerUid === user.uid;
+      const isParticipant = meeting?.participants?.includes(user.uid);
+      
+      // Si no es participante, agregarlo automáticamente (permitir acceso público)
+      if (!isParticipant) {
+        console.log(`➕ Adding ${user.uid} as participant to meeting ${meetingId}`);
+        try {
+          await db.collection('meetings').doc(meetingId).update({
+            participants: admin.firestore.FieldValue.arrayUnion(user.uid)
+          });
+        } catch (error) {
+          console.error('Error adding participant:', error);
+        }
       }
 
-      // Leave any previous meetings
+      // Leave any previous meetings first
       for (const [existingMeetingId, users] of activeMeetings.entries()) {
-        if (Array.from(users).some(u => u.socketId === socket.id)) {
+        const existingUser = Array.from(users).find(u => u.userId === user.uid);
+        if (existingUser) {
+          users.delete(existingUser);
           socket.leave(existingMeetingId);
+          console.log(`🔄 User ${user.uid} left previous meeting ${existingMeetingId}`);
         }
       }
 
       // Join the meeting room
       socket.join(meetingId);
       
-      // Add user to active meetings
+      // ✅ CRITICAL: Remove duplicates before adding
       if (!activeMeetings.has(meetingId)) {
         activeMeetings.set(meetingId, new Set());
+      }
+      
+      const meetingUsers = activeMeetings.get(meetingId)!;
+      
+      // Remove any existing instance of this user (by userId, not socketId)
+      for (const existingUser of Array.from(meetingUsers)) {
+        if (existingUser.userId === user.uid) {
+          meetingUsers.delete(existingUser);
+          console.log(`🔄 Removed duplicate user entry for ${user.uid}`);
+        }
       }
       
       const userData: User = {
@@ -158,20 +176,22 @@ io.on('connection', (socket: Socket) => {
         joinedAt: new Date().toISOString()
       };
       
-      activeMeetings.get(meetingId)!.add(userData);
+      meetingUsers.add(userData);
 
       // Get current participants
       const participants = Array.from(activeMeetings.get(meetingId) || []);
       
-      // Notify others about new user
+      // ✅ Notify OTHERS about new user (no al que se une)
       socket.to(meetingId).emit('user_joined', {
         userId: user.uid,
         displayName: user.name,
+        email: user.email,
+        participants: participants, // Lista completa
         participantsCount: participants.length,
         timestamp: new Date().toISOString()
       });
 
-      // Send current participants and meeting info to the new user
+      // ✅ Send current participants to the NEW user
       socket.emit('meeting_joined', {
         meetingId,
         participants,
@@ -188,8 +208,7 @@ io.on('connection', (socket: Socket) => {
   });
 
   /**
-   * Send chat message
-   * @param data - Message data
+   * Send chat message - ✅ CORREGIDO: no duplicar
    */
   socket.on('send_message', async (data: {
     meetingId: string;
@@ -215,10 +234,11 @@ io.on('connection', (socket: Socket) => {
         timestamp: new Date().toISOString()
       };
 
-      // Broadcast message to all in the meeting room
+      // ✅ CORRECCIÓN: Enviar a TODA la sala (incluyendo emisor)
+      // Socket.IO maneja esto correctamente con io.to()
       io.to(meetingId).emit('new_message', messageData);
       
-      // Store message in Firestore for history
+      // Store message in Firestore
       await storeMessageInFirestore(meetingId, messageData);
       
       console.log(`💬 Message sent in meeting ${meetingId} by ${user.uid}`);
@@ -231,11 +251,11 @@ io.on('connection', (socket: Socket) => {
 
   /**
    * Handle user typing start
-   * @param data - Typing data
    */
   socket.on('typing_start', (data: { meetingId: string }) => {
     const { meetingId } = data;
     
+    // ✅ Solo notificar a OTROS (no a quien está escribiendo)
     socket.to(meetingId).emit('user_typing', {
       userId: user.uid,
       displayName: user.name
@@ -244,7 +264,6 @@ io.on('connection', (socket: Socket) => {
 
   /**
    * Handle user typing stop
-   * @param data - Typing data
    */
   socket.on('typing_stop', (data: { meetingId: string }) => {
     const { meetingId } = data;
@@ -267,10 +286,13 @@ io.on('connection', (socket: Socket) => {
       if (userToRemove) {
         users.delete(userToRemove);
         
+        const remainingParticipants = Array.from(users);
+        
         // Notify others about user leaving
         socket.to(meetingId).emit('user_left', {
           userId: user.uid,
           displayName: user.name,
+          participants: remainingParticipants,
           participantsCount: users.size,
           timestamp: new Date().toISOString()
         });
@@ -289,8 +311,6 @@ io.on('connection', (socket: Socket) => {
 
 /**
  * Store message in Firestore for history
- * @param meetingId - Meeting ID
- * @param messageData - Message data to store
  */
 async function storeMessageInFirestore(meetingId: string, messageData: ChatMessage): Promise<void> {
   try {
@@ -305,7 +325,6 @@ async function storeMessageInFirestore(meetingId: string, messageData: ChatMessa
 
 /**
  * Health check endpoint
- * @route GET /api/health
  */
 app.get('/api/health', (req, res) => {
   res.json({
@@ -323,7 +342,6 @@ app.get('/api/health', (req, res) => {
 
 /**
  * Get meeting participants
- * @route GET /api/meetings/:meetingId/participants
  */
 app.get('/api/meetings/:meetingId/participants', async (req, res) => {
   try {
@@ -343,9 +361,6 @@ app.get('/api/meetings/:meetingId/participants', async (req, res) => {
   }
 });
 
-/**
- * 404 handler
- */
 app.use('*', (req, res) => {
   res.status(404).json({
     success: false,
@@ -354,9 +369,6 @@ app.use('*', (req, res) => {
   });
 });
 
-/**
- * Error handling middleware
- */
 app.use((
   err: any,
   req: express.Request,
@@ -372,9 +384,6 @@ app.use((
 
 const PORT = process.env.PORT || 3001;
 
-/**
- * Start the server
- */
 server.listen(PORT, () => {
   console.log(`🚀 LinkUp Chat Server running on port ${PORT}`);
   console.log(`📊 Environment: ${process.env.NODE_ENV || 'development'}`);
